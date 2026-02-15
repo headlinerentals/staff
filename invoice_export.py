@@ -1,0 +1,385 @@
+from __future__ import annotations
+
+import io
+import textwrap
+from pathlib import Path
+
+import pandas as pd
+
+
+PRIMARY_COLOR = "#5927e5"
+SECONDARY_COLOR = "#a7eaff"
+TEXT_COLOR = "#111111"
+
+
+def money(value: float, currency: str = "JM$") -> str:
+    return f"{currency}{float(value):,.2f}"
+
+
+def _safe_text(value: object) -> str:
+    if value is None:
+        return ""
+    text = str(value).strip()
+    return text if text.lower() not in {"nan", "none"} else ""
+
+
+def build_invoice_payload(
+    header: dict,
+    items: pd.DataFrame,
+    business_name: str,
+    currency: str = "JM$",
+    bank_info: dict | None = None,
+) -> dict:
+    rows = items.copy()
+    if rows.empty:
+        rows = pd.DataFrame(
+            columns=["item_name", "item_type", "quantity", "unit_price", "line_total"]
+        )
+
+    if "line_total" not in rows.columns:
+        rows["line_total"] = (
+            pd.to_numeric(rows.get("quantity", 0), errors="coerce").fillna(0.0)
+            * pd.to_numeric(rows.get("unit_price", 0), errors="coerce").fillna(0.0)
+        )
+    rows["quantity"] = pd.to_numeric(rows.get("quantity", 0), errors="coerce").fillna(0.0)
+    rows["unit_price"] = pd.to_numeric(rows.get("unit_price", 0), errors="coerce").fillna(0.0)
+    rows["line_total"] = pd.to_numeric(rows.get("line_total", 0), errors="coerce").fillna(0.0)
+
+    total = float(rows["line_total"].sum())
+    payment_status = _safe_text(header.get("payment_status") or "paid_full").lower()
+    if payment_status not in {"unpaid", "deposit_paid", "paid_full"}:
+        payment_status = "paid_full"
+    amount_paid_raw = pd.to_numeric(header.get("amount_paid", 0), errors="coerce")
+    amount_paid = float(0.0 if pd.isna(amount_paid_raw) else amount_paid_raw)
+    amount_paid = max(0.0, amount_paid)
+    if payment_status == "deposit_paid":
+        deposit_due_now = round(total * 0.5, 2)
+        balance_due_later = round(max(total - deposit_due_now, 0.0), 2)
+    else:
+        deposit_due_now = 0.0
+        balance_due_later = round(max(total - amount_paid, 0.0), 2)
+    bank_defaults = {
+        "seller_name": "Headline Event Rentals",
+        "seller_address_1": "61 West Main Drive",
+        "seller_address_2": "Kingston",
+        "bank_account_name": "Headline Event Rentals",
+        "bank_account_type": "Scotia Savings Account (JM$)",
+        "bank_branch": "HWT",
+        "bank_account_number": "909039",
+    }
+    merged_bank = {**bank_defaults, **(bank_info or {})}
+    return {
+        "business_name": _safe_text(business_name) or "Headline Rentals",
+        "invoice_number": _safe_text(header.get("invoice_number")),
+        "document_type": _safe_text(header.get("document_type") or "invoice").lower(),
+        "order_status": _safe_text(header.get("order_status") or "confirmed").lower(),
+        "event_date": _safe_text(header.get("event_date")),
+        "event_time": _safe_text(header.get("event_time")),
+        "rental_hours": float(header.get("rental_hours") or 24),
+        "event_location": _safe_text(header.get("event_location")),
+        "customer_name": _safe_text(header.get("customer_name")),
+        "customer_phone": _safe_text(header.get("customer_phone")),
+        "customer_email": _safe_text(header.get("customer_email")),
+        "delivered_to": _safe_text(header.get("delivered_to")),
+        "paid_to": _safe_text(header.get("paid_to")),
+        "payment_status": payment_status,
+        "amount_paid": amount_paid,
+        "payment_notes": _safe_text(header.get("payment_notes")),
+        "notes": _safe_text(header.get("notes")),
+        "items": rows[["item_name", "item_type", "quantity", "unit_price", "line_total"]].copy(),
+        "total": total,
+        "deposit_due_now": deposit_due_now,
+        "balance_due_later": balance_due_later,
+        "currency": currency or "JM$",
+        "seller_name": _safe_text(merged_bank.get("seller_name")),
+        "seller_address_1": _safe_text(merged_bank.get("seller_address_1")),
+        "seller_address_2": _safe_text(merged_bank.get("seller_address_2")),
+        "bank_account_name": _safe_text(merged_bank.get("bank_account_name")),
+        "bank_account_type": _safe_text(merged_bank.get("bank_account_type")),
+        "bank_branch": _safe_text(merged_bank.get("bank_branch")),
+        "bank_account_number": _safe_text(merged_bank.get("bank_account_number")),
+    }
+
+
+def _build_invoice_image(payload: dict, logo_path: str | Path | None = None):
+    try:
+        from PIL import Image, ImageDraw, ImageFont
+    except ImportError as exc:
+        raise RuntimeError("Invoice export needs Pillow. Install it with `pip install pillow`.") from exc
+
+    rows = max(len(payload["items"]), 1)
+    if rows <= 8:
+        layout_scale = 1.0
+    elif rows <= 14:
+        layout_scale = 0.94
+    elif rows <= 22:
+        layout_scale = 0.88
+    else:
+        layout_scale = 0.82
+
+    def ys(value: int) -> int:
+        return max(1, int(round(float(value) * layout_scale)))
+
+    line_h_body = max(28, ys(38))
+    line_h_small = max(20, ys(30))
+    line_h_block = max(24, ys(34))
+    table_header_h = max(44, ys(56))
+
+    height = max(1520, ys(980) + rows * (line_h_body + max(4, ys(6))))
+    width = 1600
+
+    image = Image.new("RGB", (width, height), "white")
+    draw = ImageDraw.Draw(image)
+
+    def resolve_logo_file(candidate_path: str | Path | None) -> Path | None:
+        candidates: list[Path] = []
+        if candidate_path:
+            try:
+                candidates.append(Path(candidate_path).expanduser())
+            except Exception:
+                pass
+        assets_dir = Path(__file__).resolve().with_name("assets")
+        candidates.extend(
+            [
+                assets_dir / "headline-rentals-logo.png",
+                assets_dir / "headline-rentals-logo.jpg",
+                assets_dir / "headline-rentals-logo.jpeg",
+                assets_dir / "logo.png",
+            ]
+        )
+        seen: set[str] = set()
+        for path in candidates:
+            key = str(path)
+            if key in seen:
+                continue
+            seen.add(key)
+            try:
+                if path.exists() and path.is_file():
+                    return path
+            except Exception:
+                continue
+        return None
+
+    def font(size: int, bold: bool = False):
+        font_candidates = [
+            "DejaVuSans-Bold.ttf" if bold else "DejaVuSans.ttf",
+            "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"
+            if bold
+            else "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+            "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf"
+            if bold
+            else "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
+            "/Library/Fonts/Arial Bold.ttf" if bold else "/Library/Fonts/Arial.ttf",
+            "/System/Library/Fonts/Supplemental/Arial Bold.ttf"
+            if bold
+            else "/System/Library/Fonts/Supplemental/Arial.ttf",
+            "/System/Library/Fonts/Supplemental/Helvetica.ttc",
+        ]
+        for path in font_candidates:
+            try:
+                return ImageFont.truetype(path, size=size)
+            except Exception:
+                continue
+        # Final fallback for hosted environments with limited system fonts.
+        # Pillow >=10.1 supports load_default(size=...), which keeps text readable.
+        try:
+            return ImageFont.load_default(size=size)
+        except TypeError:
+            fallback = ImageFont.load_default()
+            if hasattr(fallback, "font_variant"):
+                try:
+                    return fallback.font_variant(size=size)
+                except Exception:
+                    pass
+            return fallback
+
+    f_title = font(max(40, ys(58)), bold=True)
+    f_h1 = font(max(30, ys(42)), bold=True)
+    f_h2 = font(max(22, ys(30)), bold=True)
+    f_body = font(max(18, ys(26)))
+    f_small = font(max(16, ys(22)))
+
+    draw.rectangle((0, 0, width, ys(18)), fill=PRIMARY_COLOR)
+
+    logo_rendered = False
+    resolved_logo_path = resolve_logo_file(logo_path)
+    if resolved_logo_path is not None:
+        try:
+            logo = Image.open(resolved_logo_path).convert("RGBA")
+            logo.thumbnail((ys(170), ys(170)))
+            image.paste(logo, (56, ys(40)), mask=logo)
+            logo_rendered = True
+        except Exception:
+            logo_rendered = False
+    if not logo_rendered:
+        # Keep invoice brand identity visible even if image file is missing.
+        lx, ly = 56, ys(40)
+        draw.rounded_rectangle(
+            (lx, ly, lx + ys(170), ly + ys(170)),
+            radius=ys(20),
+            outline=SECONDARY_COLOR,
+            width=3,
+            fill="#F6FAFF",
+        )
+        draw.text((lx + ys(24), ly + ys(45)), "HR", fill=PRIMARY_COLOR, font=f_h1)
+        draw.text((lx + ys(20), ly + ys(104)), "Rentals", fill=PRIMARY_COLOR, font=f_small)
+
+    doc_type = str(payload.get("document_type", "invoice")).strip().lower()
+    status = str(payload.get("order_status", "confirmed")).strip().lower()
+    doc_title = "PRICE QUOTE" if doc_type == "quote" else "INVOICE"
+    draw.text((245, ys(58)), payload["business_name"], fill=TEXT_COLOR, font=f_h1)
+    draw.text((width - 520, ys(58)), doc_title, fill=PRIMARY_COLOR, font=f_title)
+    draw.text((width - 440, ys(140)), f"#{payload['invoice_number']}", fill=TEXT_COLOR, font=f_h2)
+    draw.text((width - 440, ys(188)), f"Status: {status.upper()}", fill=TEXT_COLOR, font=f_small)
+
+    draw.text((56, ys(240)), "Customer", fill=PRIMARY_COLOR, font=f_h2)
+    draw.text((840, ys(240)), "Event", fill=PRIMARY_COLOR, font=f_h2)
+
+    customer_wrap = 48 if layout_scale >= 0.95 else 56
+    event_wrap = 44 if layout_scale >= 0.95 else 52
+
+    y_left = ys(294)
+    for line in [
+        payload["customer_name"],
+        f"Phone: {payload['customer_phone']}" if payload["customer_phone"] else "",
+        f"Email: {payload['customer_email']}" if payload["customer_email"] else "",
+    ]:
+        if line:
+            for wrapped in textwrap.wrap(line, width=customer_wrap)[:2]:
+                draw.text((56, y_left), wrapped, fill=TEXT_COLOR, font=f_body)
+                y_left += line_h_body
+
+    y_right = ys(294)
+    for line in [
+        f"Date: {payload['event_date']}",
+        f"Time: {payload['event_time']}",
+        f"Duration: {payload['rental_hours']:g}h",
+        f"Location: {(payload['event_location'] or payload['delivered_to'])}",
+    ]:
+        for wrapped in textwrap.wrap(line, width=event_wrap)[:2]:
+            draw.text((840, y_right), wrapped, fill=TEXT_COLOR, font=f_body)
+            y_right += line_h_body
+
+    seller_block_top = max(y_left, y_right) + ys(24)
+    seller_lines = [
+        f"Seller: {payload.get('seller_name', '')}",
+        payload.get("seller_address_1", ""),
+        payload.get("seller_address_2", ""),
+        "",
+        "Banking Info:",
+        f"Name: {payload.get('bank_account_name', '')}",
+        payload.get("bank_account_type", ""),
+        f"Branch: {payload.get('bank_branch', '')}",
+        (
+            f"Account #{payload.get('bank_account_number', '')}"
+            if payload.get("bank_account_number", "")
+            else ""
+        ),
+    ]
+    seller_lines = [str(line).strip() for line in seller_lines if str(line).strip()]
+    block_height = ys(28) + (len(seller_lines) * line_h_block)
+    draw.rounded_rectangle(
+        (44, seller_block_top, width - 44, seller_block_top + block_height),
+        radius=ys(12),
+        outline=SECONDARY_COLOR,
+        width=3,
+        fill="#F8FBFF",
+    )
+    seller_y = seller_block_top + ys(16)
+    for idx, line in enumerate(seller_lines):
+        line_font = f_h2 if idx in {0, 4} else f_body
+        draw.text((64, seller_y), line, fill=TEXT_COLOR, font=line_font)
+        seller_y += line_h_block
+
+    table_top = seller_block_top + block_height + ys(30)
+    draw.rectangle((44, table_top, width - 44, table_top + table_header_h), fill=SECONDARY_COLOR)
+    table_header_y = table_top + max(8, ys(12))
+    draw.text((64, table_header_y), "Description", fill=TEXT_COLOR, font=f_h2)
+    draw.text((880, table_header_y), "Qty", fill=TEXT_COLOR, font=f_h2)
+    draw.text((1020, table_header_y), f"Unit ({payload['currency']})", fill=TEXT_COLOR, font=f_h2)
+    draw.text((1310, table_header_y), f"Total ({payload['currency']})", fill=TEXT_COLOR, font=f_h2)
+
+    y = table_top + table_header_h + max(10, ys(14))
+    desc_wrap = 54 if layout_scale >= 0.95 else (62 if layout_scale >= 0.88 else 70)
+    if payload["items"].empty:
+        draw.text((64, y), "No line items", fill=TEXT_COLOR, font=f_body)
+        y += line_h_body
+
+    for _, row in payload["items"].iterrows():
+        item_name = _safe_text(row.get("item_name"))
+        qty = float(row.get("quantity") or 0.0)
+        unit = float(row.get("unit_price") or 0.0)
+        line_total = float(row.get("line_total") or 0.0)
+
+        wrapped = textwrap.wrap(item_name, width=desc_wrap) or [item_name]
+        draw.text((64, y), wrapped[0], fill=TEXT_COLOR, font=f_body)
+        draw.text((890, y), f"{qty:g}", fill=TEXT_COLOR, font=f_body)
+        draw.text((1044, y), f"{unit:,.2f}", fill=TEXT_COLOR, font=f_body)
+        draw.text((1338, y), f"{line_total:,.2f}", fill=TEXT_COLOR, font=f_body)
+        y += line_h_body
+
+        for extra in wrapped[1:3]:
+            draw.text((78, y), extra, fill=TEXT_COLOR, font=f_small)
+            y += line_h_small
+        y += max(4, ys(6))
+
+    y += ys(20)
+    draw.line((940, y, width - 56, y), fill=PRIMARY_COLOR, width=max(2, ys(3)))
+    y += ys(24)
+    draw.text(
+        (940, y),
+        f"Total Cost: {money(payload['total'], payload['currency'])}",
+        fill=PRIMARY_COLOR,
+        font=f_h1,
+    )
+
+    payment_status = str(payload.get("payment_status", "paid_full")).strip().lower()
+    if payment_status == "deposit_paid":
+        y += ys(58)
+        draw.text(
+            (940, y),
+            f"Deposit Due Now (50%): {money(payload.get('deposit_due_now', 0.0), payload['currency'])}",
+            fill=TEXT_COLOR,
+            font=f_h2,
+        )
+    elif payment_status == "unpaid":
+        y += ys(58)
+        draw.text(
+            (940, y),
+            f"Amount Due Now: {money(payload['total'], payload['currency'])}",
+            fill=TEXT_COLOR,
+            font=f_h2,
+        )
+    else:
+        y += ys(58)
+        draw.text(
+            (940, y),
+            f"Amount Paid: {money(payload.get('amount_paid', payload['total']), payload['currency'])}",
+            fill=TEXT_COLOR,
+            font=f_h2,
+        )
+
+    y += ys(72)
+    note = payload["notes"] or "Thank you for choosing Headline Rentals."
+    note_wrap = 98 if layout_scale >= 0.95 else 112
+    for wrapped in textwrap.wrap(f"Notes: {note}", width=note_wrap)[:3]:
+        draw.text((56, y), wrapped, fill=TEXT_COLOR, font=f_small)
+        y += line_h_small
+
+    return image
+
+
+def render_invoice_pdf(payload: dict, logo_path: str | Path | None = None) -> bytes:
+    image = _build_invoice_image(payload, logo_path=logo_path)
+    out = io.BytesIO()
+    image.save(out, format="PDF", resolution=180.0)
+    out.seek(0)
+    return out.getvalue()
+
+
+def render_invoice_png(payload: dict, logo_path: str | Path | None = None) -> bytes:
+    image = _build_invoice_image(payload, logo_path=logo_path)
+    out = io.BytesIO()
+    image.save(out, format="PNG")
+    out.seek(0)
+    return out.getvalue()
