@@ -1,0 +1,10 @@
+.venv/
+__pycache__/
+*.pyc
+finance_hub.db
+finance_hub_live_backup.db
+finance_hub.before_restore_*.db
+auto_backups/
+uploads/
+.streamlit/secrets.toml
+.DS_Store
