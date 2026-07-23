@@ -512,7 +512,7 @@ def _ensure_remote_backup_branch_exists() -> bool:
     if not REMOTE_BACKUP_ENABLED:
         return False
     branch = quote(REMOTE_BACKUP_BRANCH or "backup-storage", safe="")
-    status_branch, _ = _github_json_request(
+    status_branch, branch_meta = _github_json_request(
         f"https://api.github.com/repos/{REMOTE_BACKUP_REPO}/branches/{branch}",
         method="GET",
     )
@@ -520,6 +520,21 @@ def _ensure_remote_backup_branch_exists() -> bool:
         _REMOTE_BRANCH_READY = True
         return True
     if status_branch not in {404, 422}:
+        api_message = str(branch_meta.get("message") or "").strip() if isinstance(branch_meta, dict) else ""
+        if status_branch == 401:
+            detail = "GitHub returned 401 Unauthorized — the token is invalid, revoked, or expired."
+        elif status_branch == 403:
+            detail = "GitHub returned 403 Forbidden — the token doesn't have permission to read this repo (wrong scope, or it's not authorized for this repository)."
+        elif status_branch == 0:
+            detail = "No response at all — a network/DNS problem reaching api.github.com, not a credentials issue."
+        else:
+            detail = f"Unexpected HTTP {status_branch} checking for the branch."
+        _record_push_result(
+            False,
+            f"{detail}"
+            + (f" GitHub said: {api_message}" if api_message else "")
+            + f" (checked repo '{REMOTE_BACKUP_REPO}', branch '{REMOTE_BACKUP_BRANCH}')",
+        )
         return False
 
     status_repo, repo_meta = _github_json_request(
@@ -527,6 +542,13 @@ def _ensure_remote_backup_branch_exists() -> bool:
         method="GET",
     )
     if status_repo != 200:
+        api_message = str(repo_meta.get("message") or "").strip() if isinstance(repo_meta, dict) else ""
+        _record_push_result(
+            False,
+            f"Branch didn't exist yet and creating it failed: could not read repo "
+            f"'{REMOTE_BACKUP_REPO}' (HTTP {status_repo})."
+            + (f" GitHub said: {api_message}" if api_message else " Likely a wrong repo name in HR_REMOTE_BACKUP_REPO."),
+        )
         return False
     default_branch = str(repo_meta.get("default_branch") or "main").strip() or "main"
 
@@ -535,18 +557,28 @@ def _ensure_remote_backup_branch_exists() -> bool:
         method="GET",
     )
     if status_ref != 200:
+        api_message = str(ref_meta.get("message") or "").strip() if isinstance(ref_meta, dict) else ""
+        _record_push_result(
+            False,
+            f"Could not read the tip of the default branch '{default_branch}' "
+            f"(HTTP {status_ref})."
+            + (f" GitHub said: {api_message}" if api_message else ""),
+        )
         return False
     base_sha = (
         str((((ref_meta.get("object") or {}).get("sha")) or "")).strip()
     )
     if not base_sha:
+        _record_push_result(
+            False, f"GitHub's response for branch '{default_branch}' had no commit SHA in it."
+        )
         return False
 
     create_payload = {
         "ref": f"refs/heads/{REMOTE_BACKUP_BRANCH or 'backup-storage'}",
         "sha": base_sha,
     }
-    status_create, _ = _github_json_request(
+    status_create, create_meta = _github_json_request(
         f"https://api.github.com/repos/{REMOTE_BACKUP_REPO}/git/refs",
         method="POST",
         payload=create_payload,
@@ -554,6 +586,12 @@ def _ensure_remote_backup_branch_exists() -> bool:
     if status_create in {201, 422}:
         _REMOTE_BRANCH_READY = True
         return True
+    api_message = str(create_meta.get("message") or "").strip() if isinstance(create_meta, dict) else ""
+    _record_push_result(
+        False,
+        f"Creating the backup-storage branch failed (HTTP {status_create})."
+        + (f" GitHub said: {api_message}" if api_message else " Likely the token lacks write/contents permission on this repo."),
+    )
     return False
 
 
@@ -585,10 +623,16 @@ def push_remote_backup_snapshot(reason: str = "auto", force: bool = False) -> bo
             "HR_REMOTE_BACKUP_TOKEN is missing or still a placeholder value.",
         )
     if not _ensure_remote_backup_branch_exists():
+        # _ensure_remote_backup_branch_exists already recorded the exact reason
+        # (specific HTTP status + GitHub's own message) — don't overwrite it
+        # with a generic guess.
+        existing_info = get_last_remote_push_info()
+        if existing_info.get("reason"):
+            return False
         return _record_push_result(
             False,
-            "Could not confirm or create the backup-storage branch on GitHub — "
-            "likely an invalid/expired token, wrong repo name, or a permissions problem.",
+            "Could not confirm or create the backup-storage branch on GitHub, "
+            "for an unrecorded reason.",
         )
     if not DB_PATH.exists() or not DB_PATH.is_file():
         return _record_push_result(False, "Local database file does not exist.")
